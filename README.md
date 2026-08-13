@@ -82,8 +82,3 @@ docs/theory-data.md the "why" behind the pipeline
 
 - Base model: **`Qwen/Qwen3-1.7B`** (fine-tuned on Day 2 with QLoRA).
 - Data: **`gbharti/finance-alpaca`** (Alpaca format: instruction/input/output; no category) + curated honesty examples.
-
-## License
-
-Code: MIT (educational). The dataset and model carry their own licenses — check
-their Hugging Face cards before commercial use.
