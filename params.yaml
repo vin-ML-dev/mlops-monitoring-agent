@@ -1,0 +1,14 @@
+# DVC pipeline knobs (tracked by DVC so a change re-runs the right stages).
+
+seed: 42
+
+ingest:
+  source: hf                     # "sample" (offline) or "hf" (stream)
+  hf_dataset: "gbharti/finance-alpaca"
+  sample_size: 8000                  # fetch a bit more than 7000 so enough survive curation
+
+# fixed counts:  train / test / validate  = 5000 / 1000 / 1000
+split:
+  train: 5000
+  val: 1000
+  test: 1000

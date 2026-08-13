@@ -1,0 +1,19 @@
+# Data-pipeline dependencies.
+# Core (needed to run the pipeline with the regex PII layer):
+pydantic>=2.6
+langdetect>=1.0.9
+PyYAML>=6.0
+
+# Data source + versioning:
+datasets>=2.19        # stream the Bitext support dataset from Hugging Face
+dvc>=3.50             # data + pipeline versioning
+
+# Optional NER PII layer (enable pii.use_presidio: true). Install via `make install-pii`:
+# presidio-analyzer>=2.2
+# presidio-anonymizer>=2.2
+# spacy>=3.7           # then: python -m spacy download en_core_web_lg
+
+# Dev tooling:
+pytest>=8.0
+ruff>=0.6
+pre-commit>=3.7

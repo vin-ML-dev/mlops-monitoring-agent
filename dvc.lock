@@ -1,0 +1,124 @@
+schema: '2.0'
+stages:
+  ingest:
+    cmd: python -m src.data.ingest
+    deps:
+    - path: data/raw/finance_sample.jsonl
+      hash: md5
+      md5: e1228f9d40bc22183ccae8eb17fd1ff1
+      size: 5035
+    - path: src/data/ingest.py
+      hash: md5
+      md5: 28c71bd60b7a6b4d53a6b12e08b8aaf2
+      size: 2031
+    params:
+      params.yaml:
+        ingest:
+          source: hf
+          hf_dataset: gbharti/finance-alpaca
+          sample_size: 8000
+        seed: 42
+    outs:
+    - path: data/interim/ingested.jsonl
+      hash: md5
+      md5: d4a971fab234859ab306b07652aae5ba
+      size: 9308468
+  curate:
+    cmd: python -m src.data.curate
+    deps:
+    - path: configs/data.yaml
+      hash: md5
+      md5: 623e46e384bfc872e41df01e3800b030
+      size: 1427
+    - path: data/interim/ingested.jsonl
+      hash: md5
+      md5: d4a971fab234859ab306b07652aae5ba
+      size: 9308468
+    - path: src/data/curate.py
+      hash: md5
+      md5: 26b3677d018f1378a0bdf5e81bd87973
+      size: 8365
+    - path: src/data/quality_filters.py
+      hash: md5
+      md5: af0cc83904ddeae652be105f6fb22946
+      size: 2601
+    outs:
+    - path: data/interim/curated.jsonl
+      hash: md5
+      md5: fae6152b2747c35e42db357802841f31
+      size: 8155716
+    - path: data/interim/curation_report.json
+      hash: md5
+      md5: 11e84b42ff9be5872146c4b32fd9c376
+      size: 311
+  build:
+    cmd: python -m src.data.build_dataset
+    deps:
+    - path: configs/data.yaml
+      hash: md5
+      md5: 623e46e384bfc872e41df01e3800b030
+      size: 1427
+    - path: data/interim/curated.jsonl
+      hash: md5
+      md5: fae6152b2747c35e42db357802841f31
+      size: 8155716
+    - path: src/data/build_dataset.py
+      hash: md5
+      md5: 65775a299f75cee17d963b19bf7a1804
+      size: 3897
+    outs:
+    - path: data/interim/built.jsonl
+      hash: md5
+      md5: aa8914d292eb4fc0d9c5df6f38dca01c
+      size: 10339983
+  validate:
+    cmd: python -m src.data.validate
+    deps:
+    - path: data/interim/built.jsonl
+      hash: md5
+      md5: aa8914d292eb4fc0d9c5df6f38dca01c
+      size: 10339983
+    - path: src/data/validate.py
+      hash: md5
+      md5: b6d2fdeccc1081eca3eac9c9c3d5f0bb
+      size: 2361
+    outs:
+    - path: data/interim/validated.jsonl
+      hash: md5
+      md5: aa8914d292eb4fc0d9c5df6f38dca01c
+      size: 10339983
+  split:
+    cmd: python -m src.data.split
+    deps:
+    - path: configs/data.yaml
+      hash: md5
+      md5: 623e46e384bfc872e41df01e3800b030
+      size: 1427
+    - path: data/interim/validated.jsonl
+      hash: md5
+      md5: aa8914d292eb4fc0d9c5df6f38dca01c
+      size: 10339983
+    - path: src/data/split.py
+      hash: md5
+      md5: c8e1c636286571b56814036c38383a23
+      size: 3337
+    params:
+      params.yaml:
+        seed: 42
+        split:
+          train: 5000
+          val: 1000
+          test: 1000
+    outs:
+    - path: data/processed/test.jsonl
+      hash: md5
+      md5: 8de005595645dc42ea11093c12b3b6df
+      size: 1379627
+    - path: data/processed/train.jsonl
+      hash: md5
+      md5: c7013bd64e4d8df11b7af9d1a9ce4138
+      size: 7040520
+    - path: data/processed/val.jsonl
+      hash: md5
+      md5: fa6ade63ee3cb3d3e6d17080b9759c38
+      size: 1428373

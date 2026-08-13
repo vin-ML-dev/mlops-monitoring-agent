@@ -1,0 +1,29 @@
+# Curation rules the pipeline reads (the "what counts as good data" settings).
+
+filters:
+  min_chars: 15                 # each of user-text/response must be at least this long
+  max_chars: 4000               # ...and at most this long
+  allowed_languages: ["en"]     # keep English only
+  echo_overlap: 0.9             # response too similar to the prompt => echo
+  max_repetition_ratio: 0.45    # unique/total words below this => repetitive
+  min_words_for_repetition: 20  # only check repetition on longer answers
+  min_chars_for_truncation: 40  # only check truncation on longer answers
+  refusal_markers:              # low-quality "won't answer" boilerplate to drop
+    - "as an ai"
+    - "i cannot"
+    - "i can't"
+    - "i am unable"
+    - "i'm unable"
+    - "i am not able"
+    - "i apologize, but i cannot"
+
+pii:
+  use_presidio: false           # regex backstop is ALWAYS on; set true after `make install-pii`
+  scrub_types: ["EMAIL", "PHONE", "CREDIT_CARD", "US_SSN", "IP_ADDRESS"]
+
+build:
+  add_honesty_examples: true    # inject curated "I can't guarantee / I don't know" finance examples
+  system_prompt: "You are a helpful, honest financial-education assistant. You explain concepts clearly, never guarantee returns or predict specific prices, and you remind users you are not a licensed financial advisor."
+
+split:
+  stratify_by: null             # finance-alpaca has no category -> random split (correct here)

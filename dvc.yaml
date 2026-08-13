@@ -1,0 +1,58 @@
+# DVC pipeline: ingest -> curate -> build -> validate -> split
+# `dvc repro` re-runs only the stages whose inputs changed, and records exactly
+# which data produced which outputs (provenance for "which data trained the model?").
+stages:
+  ingest:
+    cmd: python -m src.data.ingest
+    deps:
+      - src/data/ingest.py
+      - data/raw/finance_sample.jsonl
+    params:
+      - seed
+      - ingest
+    outs:
+      - data/interim/ingested.jsonl
+
+  curate:
+    cmd: python -m src.data.curate
+    deps:
+      - src/data/curate.py
+      - src/data/quality_filters.py
+      - configs/data.yaml
+      - data/interim/ingested.jsonl
+    outs:
+      - data/interim/curated.jsonl
+    metrics:
+      - data/interim/curation_report.json:
+          cache: false
+
+  build:
+    cmd: python -m src.data.build_dataset
+    deps:
+      - src/data/build_dataset.py
+      - configs/data.yaml
+      - data/interim/curated.jsonl
+    outs:
+      - data/interim/built.jsonl
+
+  validate:
+    cmd: python -m src.data.validate
+    deps:
+      - src/data/validate.py
+      - data/interim/built.jsonl
+    outs:
+      - data/interim/validated.jsonl
+
+  split:
+    cmd: python -m src.data.split
+    deps:
+      - src/data/split.py
+      - configs/data.yaml
+      - data/interim/validated.jsonl
+    params:
+      - seed
+      - split
+    outs:
+      - data/processed/train.jsonl
+      - data/processed/val.jsonl
+      - data/processed/test.jsonl
