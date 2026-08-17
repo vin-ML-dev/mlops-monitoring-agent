@@ -1,0 +1,102 @@
+# ============================================================================
+# Day 2 — QLoRA fine-tuning config  (finbot v1 baseline)
+#
+# Status: v1 BASELINE. Quality is "average / OK for an educational demo" — the
+# model is coherent and the honesty guardrails work, but it can be verbose and
+# is not consistently accurate on fine details. Root cause is DATA QUALITY:
+# finance-alpaca is forum-sourced and stylistically noisy (model quality is
+# bounded by data quality). A future v2 will focus on cleaner data.
+#
+# Tuned for a single 12GB GPU (RTX 3060). EDIT the hub.* fields before pushing.
+# ============================================================================
+
+model:
+  base_id: "Qwen/Qwen3-1.7B"     # base model to fine-tune (needs transformers >= 4.51)
+  max_seq_len: 1024              # tuned for 12GB. Raise to 2048 only if the token-length
+                                 # check shows answers are being truncated (and VRAM allows)
+
+# --- QLoRA: load the base model in 4-bit so it fits a small GPU ---
+quant:
+  load_in_4bit: true
+  bnb_4bit_quant_type: "nf4"          # NF4 = the QLoRA 4-bit format
+  bnb_4bit_compute_dtype: "bfloat16"  # bf16 (RTX 3060 is Ampere -> bf16 supported)
+  bnb_4bit_use_double_quant: true     # a little extra memory saving
+
+# --- LoRA: the tiny trainable adapter we actually learn (~1-3% of params) ---
+lora:
+  r: 16                          # adapter rank (capacity). 8-32 is typical
+  alpha: 32                      # scaling (usually 2x r)
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj",
+                   "gate_proj", "up_proj", "down_proj"]   # Qwen3 attention + MLP
+
+# --- training hyper-parameters ---
+train:
+  experiment_name: "finbot-qlora"    # MLflow experiment
+  run_name: "baseline"               # change per experiment (baseline / more_epochs / rank32)
+  output_dir: "outputs/adapters/baseline"
+
+  epochs: 3                      # early stopping keeps the best epoch (val loss bottomed at ep.2)
+  lr: 0.0002                     # 1e-4 .. 2e-4 QLoRA sweet spot. Try 1e-4 for a gentler v2
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  per_device_batch_size: 2
+  grad_accum: 8                  # effective batch = 2 * 8 = 16
+  logging_steps: 5
+  seed: 42
+  bf16: true                     # auto-detected at runtime (bf16 on Ampere+, else fp16)
+  gradient_checkpointing: true   # trade compute for memory
+  use_reentrant: false           # gradient_checkpointing_kwargs (avoids a warning/instability)
+
+  # --- eval + early stopping (needs val data) ---
+  eval_strategy: "epoch"
+  save_strategy: "epoch"
+  save_total_limit: 2
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+  early_stopping_patience: 2     # stop if val loss doesn't improve for 2 epochs
+
+data:
+  train_path: "data/processed/train.jsonl"   # from Day 1 (5000 rows)
+  val_path: "data/processed/val.jsonl"        # from Day 1 (1000 rows)
+  # NOTE: the notebook's Cell 4 writes a tiny sample ONLY if these are missing.
+  # Always confirm ~5000 / ~1000 rows load before training (a 5-second run = wrong file).
+
+merge:
+  merged_dir: "outputs/merged/baseline"       # full model after merging the adapter
+
+# --- Hugging Face Hub (already pushed for v1) ---
+hub:
+  repo_id: "vinmlops/finbot-qwen3-1.7b-baseline"      # merged model repo
+  gguf_repo_id: "vinmlops/finbot-qwen3-1.7b-gguf"     # GGUF repo
+  private: true                                       # finance-derived -> private
+
+# --- GGUF conversion for CPU serving (Day 4 loads this) ---
+gguf:
+  quant: "q8_0"                  # q8_0 = the no-build path (Python converter outputs it directly).
+                                 # Q4_K_M is smaller but REQUIRES the compiled llama-quantize binary.
+  outfile_prefix: "outputs/gguf/finbot-qwen3-1.7b-baseline"
+  llama_cpp_dir: "llama.cpp"     # for convert_hf_to_gguf.py
+  # IMPORTANT: run conversion in a SEPARATE venv — llama.cpp's requirements can
+  # otherwise downgrade transformers/tokenizers and break your training env.
+
+# --- inference / decoding (how to run the model well) ---
+inference:
+  enable_thinking: false         # Qwen3 emits <think> blocks by default; OFF for direct answers
+  system_prompt: >-
+    You are a helpful, honest financial-education assistant. You explain concepts
+    clearly, never guarantee returns or predict specific prices, and you remind
+    users you are not a licensed financial advisor.
+  # anti-repetition decoding (greedy on a small model loops; these fixed it):
+  temperature: 0.3               # low = focused/factual (0.7 rambled + hallucinated)
+  top_p: 0.9
+  repetition_penalty: 1.2
+  no_repeat_ngram_size: 4
+  max_new_tokens: 256
+
+# --- MLflow ---
+mlflow:
+  tracking_uri: "file:outputs/mlruns"
+  allow_file_store: true         # export MLFLOW_ALLOW_FILE_STORE=true (newer MLflow blocks file store otherwise)
