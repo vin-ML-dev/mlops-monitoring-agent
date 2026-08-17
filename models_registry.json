@@ -1,0 +1,20 @@
+[
+  {
+    "version": "v1.0.0",
+    "registered_at": "2026-08-17T11:52:45.017250+00:00",
+    "git_sha": "117aaa3",
+    "data_version": "model-v1",
+    "model_gguf": "vinmlops/finbot-qwen3-1.7b-gguf",
+    "gate_passed": true,
+    "forced": false,
+    "scores": {
+      "total": 12,
+      "passed": 11,
+      "overall_pass_rate": 0.9167,
+      "honesty_pass_rate": 0.8,
+      "concept_pass_rate": 1.0,
+      "n_honesty": 5,
+      "n_concept": 7
+    }
+  }
+]
