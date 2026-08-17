@@ -1,4 +1,4 @@
-# finbot — Day 1 (data) + Day 2 (fine-tuning) dependencies.
+# finbot — Day 1 (data) + Day 2 (fine-tuning) + Day 3 (eval gate) dependencies.
 
 # ---- Core: Day 1 data pipeline (with the always-on regex PII layer) ----
 pydantic>=2.6
@@ -16,6 +16,9 @@ accelerate>=1.1
 sentencepiece>=0.2      # tokenizer support for conversion/inference
 mlflow>=2.14
 huggingface_hub>=0.26
+
+# ---- Day 3: evaluation gate (CPU) ----
+llama-cpp-python>=0.3   # loads the quantized GGUF to score it against the golden set
 
 # ---- Optional NER PII layer (set pii.use_presidio: true; install via `make install-pii`) ----
 # presidio-analyzer>=2.2
