@@ -1,0 +1,27 @@
+# Day 4 — model serving config.
+# The container downloads this GGUF from the Hub, then serves it on CPU via
+# llama.cpp (OpenAI-compatible API). Env vars (set by the k8s ConfigMap) override
+# these values, so the same image works across environments.
+
+model:
+  gguf_repo: "vinmlops/finbot-qwen3-1.7b-gguf"          # registered, gate-passed GGUF (Day 3)
+  gguf_file: "finbot-qwen3-1.7b-baseline-q8_0.gguf"
+  local_dir: "/models"                                  # where it's downloaded inside the pod
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  n_ctx: 2048
+  n_threads: 4          # CPU threads for inference
+  chat_format: "chatml" # Qwen3 uses ChatML-style turns
+
+# default decoding (clients/gateway can override per request) — matches Day 2/3
+decoding:
+  temperature: 0.3
+  top_p: 0.9
+  max_tokens: 256
+
+system_prompt: >-
+  You are a helpful, honest financial-education assistant. You explain concepts
+  clearly, never guarantee returns or predict specific prices, and you remind
+  users you are not a licensed financial advisor.

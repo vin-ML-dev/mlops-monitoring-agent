@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: finbot-model
+  namespace: finbot
+  labels: { app: finbot-model }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: finbot-model }
+  template:
+    metadata:
+      labels: { app: finbot-model }
+    spec:
+      containers:
+        - name: finbot-model
+          image: finbot-model:v1.0.0          # built locally + loaded into kind
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef: { name: finbot-serve-config }
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: hf-token, key: HF_TOKEN }
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+          resources:
+            requests: { cpu: "2", memory: "2Gi" }
+            limits:   { cpu: "4", memory: "4Gi" }
+          # startupProbe gives the model time to download + load (can be minutes)
+          startupProbe:
+            httpGet: { path: /v1/models, port: 8080 }
+            periodSeconds: 10
+            failureThreshold: 60          # up to ~10 min before giving up
+          readinessProbe:
+            httpGet: { path: /v1/models, port: 8080 }
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 8080 }
+            periodSeconds: 20
+            initialDelaySeconds: 30
+      volumes:
+        - name: model-cache
+          emptyDir: {}

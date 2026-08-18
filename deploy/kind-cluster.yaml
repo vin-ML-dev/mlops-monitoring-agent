@@ -1,0 +1,7 @@
+# Local dev cluster (kind). ONE node — a single laptop can't give real
+# fault-tolerance; this is for learning the workflow, not HA. Production uses
+# 3 real nodes (see the architecture diagram).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane

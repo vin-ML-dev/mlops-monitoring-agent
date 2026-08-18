@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-cpp-svc          # the name other components address (matches the architecture diagram)
+  namespace: finbot
+  labels: { app: finbot-model }
+spec:
+  selector: { app: finbot-model }   # still selects the model pod
+  ports:
+    - name: http                    # /v1 API + /metrics on the same port
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP                   # in-cluster only; the Day 5 gateway + Prometheus call this

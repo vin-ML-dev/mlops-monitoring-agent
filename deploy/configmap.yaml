@@ -1,0 +1,15 @@
+# Non-secret serving settings. Change the model or threads here without
+# rebuilding the image (the entrypoint + fetch_model read these env vars).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: finbot-serve-config
+  namespace: finbot
+data:
+  GGUF_REPO: "vinmlops/finbot-qwen3-1.7b-gguf"
+  GGUF_FILE: "finbot-qwen3-1.7b-baseline-q8_0.gguf"
+  LOCAL_DIR: "/models"
+  PORT: "8080"
+  N_CTX: "2048"
+  N_THREADS: "4"
+  CHAT_FORMAT: "chatml"
