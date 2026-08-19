@@ -1,170 +1,135 @@
 # finbot — a finance-education LLM platform (MLOps, end to end)
 
 A small **finance-education assistant** built the production way: curate data →
-fine-tune `Qwen/Qwen3-1.7B` (QLoRA) → gate it on quality → **serve it in-cluster on CPU** →
-(next) put a gateway in front and monitor it. This repo covers **Days 1–4**.
-
-- **Base model:** `Qwen/Qwen3-1.7B` · **Data:** curated `gbharti/finance-alpaca` + honesty examples
-- **Model (GGUF, gate-passed):** `vinmlops/finbot-qwen3-1.7b-gguf`
+fine-tune `Qwen/Qwen3-1.7B` (QLoRA) → gate it on quality → serve it in-cluster on CPU →
+**put a resilient gateway in front** → (next) monitor it. This repo covers **Days 1–5**.
 
 ```
 Day 1  DATA     ingest → curate (quality + PII) → build → validate → split
 Day 2  TRAIN    QLoRA fine-tune → merge → push (model + GGUF) to the Hub
 Day 3  GATE     score the GGUF vs a golden set → pass/fail → register a version
-Day 4  SERVE    run the GGUF in-cluster on CPU (llama.cpp on Kubernetes)          ← this repo
-Day 5+ GATEWAY· FastAPI + Redis → Prometheus + Alertmanager + a monitoring agent
+Day 4  SERVE    run the GGUF in-cluster on CPU (llama-cpp-svc)
+Day 5  GATEWAY  resilient FastAPI gateway + Redis in front of the model            ← this repo
+Day 6+ MONITOR  Prometheus + Alertmanager
 ```
-
-> **Model status:** v1 **baseline** — coherent with working honesty guardrails, but verbose and
-> not always accurate on fine details (quality is bounded by the forum-sourced data). Day 3
-> quantifies that objectively.
 
 ---
 
-## Day 4 — in-cluster serving (this repo's focus)
+## Day 5 — the resilient gateway (this repo's focus)
 
-Turn the registered GGUF into a **live Kubernetes service**: self-healing, health-probed,
-resource-limited, reachable at a stable in-cluster address (**`llama-cpp-svc:8080`**) — serving on
-**CPU** with an **OpenAI-compatible API** (`POST /v1/chat/completions`).
+Clients never call the model directly. A **FastAPI gateway** (Node A) treats the CPU model as a
+**slow, capacity-limited, failure-prone dependency** and makes failure **bounded, fast,
+observable, predictable, and contained**.
 
 ```
-build image → load into kind → apply manifests → pod downloads + loads the model → serve
+CLIENT → fastapi-gateway-svc:8000 → llama-cpp-svc:8080
+         auth · validation · request IDs · rate limit (Redis) · cache (Redis) ·
+         bounded concurrency · timeout budget · conservative retry ·
+         circuit breaker · SSE · /healthz /readyz /metrics
 ```
 
-**What makes it production-shaped**
+**What's implemented (every concept from the Day 5 theory guide)**
 
-- **Deployment** — self-healing (k8s restarts a crashed pod).
-- **ClusterIP Service** (`llama-cpp-svc:8080`) — the stable address the Day 5 gateway will call.
-- **ConfigMap + Secret** — model repo/threads and the HF token externalized (same image everywhere).
-- **Three probes** — a **startupProbe** for the slow model load, **readiness** to gate traffic,
-  **liveness** to trigger restarts.
-- **Resource requests/limits** — CPU inference gets its own budget.
+- **Auth** — API key, constant-time compare, never logged.
+- **Validation** — Pydantic + config caps (messages, length, max_tokens) reject bad requests
+  before they cost inference.
+- **Rate limiting** — Redis fixed-window per caller (keyed by a fingerprint, not the raw key);
+  `429` + `Retry-After`. Redis down → security-first `503`.
+- **Caching** — Redis, versioned canonical SHA-256 keys, **deterministic-only** (temp 0);
+  fail-open; invalidation by version prefix.
+- **Backpressure** — bounded per-pod concurrency to the model; no permit in time → `503`.
+- **Timeout budget** — connect/read/write/pool (not one magic number).
+- **Conservative retry** — at most one, transient pre-response failures only, never mid-stream.
+- **Circuit breaker** — local per-process `closed → open → half-open → closed`; counts backend
+  5xx, **not** client 4xx.
+- **Error taxonomy** — 401 / 422 / 429 / 503 / 504 / 500 with structured bodies (no stack traces).
+- **Observability** — `/healthz` (cheap, **model-independent** — no cascading restarts),
+  `/readyz` (Redis-aware), `/metrics` (gateway boundary instrumented separately from the model
+  boundary, ready for Day 6).
 
-**How the model gets in:** the image is model-free; at startup the container downloads the
-registered GGUF from the Hub (`fetch_model.py`) and launches llama.cpp.
+**Redis (`redis-svc`)** holds the cache + rate-limit state (agent state comes later). The circuit
+breaker stays **local** on purpose — a Redis outage can't disable protection.
 
 ---
 
-## Run Day 4 (raw kubectl — quickest path)
+## Run Day 5
 
-Needs **Docker + kind + kubectl**. Run from the repo root.
-
+**Locally (docker-compose — gateway + Redis):**
 ```bash
-# --- create the local cluster ---
-kind create cluster --name finbot --config deploy/kind-cluster.yaml
-kubectl get nodes                              # one node, STATUS = Ready
-
-# --- build the model-server image + load it into kind ---
-docker build -f serving/Dockerfile -t finbot-model:v1.0.0 .
-kind load docker-image finbot-model:v1.0.0 --name finbot
-
-# --- namespace + HF token secret (to pull the private GGUF) ---
-kubectl apply -f deploy/namespace.yaml
-export HF_TOKEN=hf_your_token
-kubectl -n finbot create secret generic hf-token \
-  --from-literal=HF_TOKEN="$HF_TOKEN" \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-# or from .env
-
-kubectl -n finbot create secret generic hf-token \
-  --from-env-file=.env \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-# --- deploy config, the model, and the service ---
-kubectl apply -f deploy/configmap.yaml
-kubectl apply -f deploy/deployment.yaml
-kubectl apply -f deploy/service.yaml
-
-# --- verify ---
-kubectl -n finbot get all
-kubectl -n finbot get pods -w                  # wait for 1/1 Running, then Ctrl-C
-kubectl -n finbot get endpoints llama-cpp-svc  # should list a pod IP:8080 (not <none>)
-
-# --- use it ---
-kubectl -n finbot port-forward svc/llama-cpp-svc 8080:8080 &
-curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"model":"finbot","messages":[{"role":"user","content":"What is an ETF?"}],"max_tokens":150}'
-
-# --- delete ---
-kind delete cluster --name finbot
+export GATEWAY_API_KEY=dev-key
+make up                     # builds + runs gateway + redis
+# point the gateway at a reachable model (e.g. port-forward llama-cpp-svc)
 ```
 
-**First start is slow:** the pod sits at `0/1` while it downloads (~1.8 GB) and loads the model —
-the **startupProbe** is what keeps k8s from killing it during that wait. Watch progress with:
+**On the cluster (needs Day 4's model already deployed):**
 ```bash
-kubectl -n finbot logs -l app=finbot-model -f   # [fetch] downloading... then [serve] launching...
+make gw-image && make gw-load          # build + load the gateway image into kind
+export GATEWAY_API_KEY=your-strong-key
+make gw-secret                         # API-key secret
+make gw-deploy                         # redis + gateway + service + hpa
+make gw-status                         # pods/svc/hpa
+make gw-forward &                      # localhost:8000 -> the gateway
+make gw-smoke                          # send a request through the gateway
+make gw-metrics                        # see the Prometheus metrics
 ```
 
-*(Prefer `make`? `make cluster-up`, `make image`, `make deploy`, `make status`, `make port-forward`,
-`make smoke` do the same steps — see `make help`.)*
+**Offline (no cluster/Redis needed):**
+```bash
+make install && make test              # 18 unit tests: breaker, auth, cache, rate-limit, backpressure...
+```
 
 ---
 
-## Days 1–3 (recap — what this serves)
+## Days 1–4 (recap — what the gateway fronts)
 
-**Day 1 — Data.** `ingest → curate → build → validate → split`, two-layer PII scrubbing with a
-**leak check that fails the pipeline**, DVC + `data-v1` tags. → 5000/1000/1000 splits.
-
-**Day 2 — Fine-tuning.** QLoRA on a single 12 GB GPU, MLflow-tracked with the data version, merged
-and pushed, then exported to a **q8_0 GGUF** for CPU serving.
-
-**Day 3 — Eval gate.** Score the quantized GGUF against a frozen golden set; **stricter bar for
-safety-critical honesty**; a non-zero exit **blocks a bad model**; approved models registered with
-a **semver + provenance** (`v1.0.0`).
+**Day 1 — Data.** curate + two-layer PII scrub + a leak check that fails the pipeline; DVC + `data-v1`.
+**Day 2 — Fine-tune.** QLoRA on a 12 GB GPU, MLflow provenance, merged + q8_0 GGUF pushed.
+**Day 3 — Gate.** score the GGUF vs a frozen golden set; stricter safety bar; non-zero exit blocks;
+register `v1.0.0`.
+**Day 4 — Serve.** the GGUF as a self-healing Kubernetes service (`llama-cpp-svc`) on CPU,
+OpenAI-compatible, with startup/readiness/liveness probes.
 
 ---
 
 ## Repo layout
 
 ```
-src/data/         Day 1 — data pipeline
-src/training/     Day 2 — QLoRA fine-tune / merge / push / GGUF
-src/evaluation/   Day 3 — metrics / gate / register
-src/serving/      Day 4 — fetch_model / payload / client
-serving/          Day 4 — Dockerfile + entrypoint (the model-server image)
-deploy/           Day 4 — kind-cluster / namespace / configmap / secret / deployment / service
-configs/          data.yaml · train.yaml · eval.yaml · serve.yaml
-docs/             theory-*.md (data / training / evaluation / serving)
-tests/            offline tests (no cluster/model needed)
+src/gateway/      Day 5 — app / schemas / auth / model_client / cache / rate_limit /
+                          concurrency / circuit_breaker / errors / metrics / request_id
+gateway/          Day 5 — Dockerfile (the gateway image)
+deploy/           Day 5 — redis + gateway (configmap / secret / deployment / service / hpa)
+configs/          gateway.yaml (timeouts, retry, breaker, cache, rate-limit, validation)
+docs/             DAY5_THEORY_GUIDE.md
+tests/            offline tests (no cluster/Redis needed)
+docker-compose.yaml   local dev: gateway + redis
 Makefile          self-documenting targets (make help)
-```
-
-## Quickstart (no cluster needed)
-
-```bash
-python3 -m venv myvenv && source myvenv/bin/activate
-make install
-make test            # config + payload + all k8s manifests validated offline
 ```
 
 ## Requirements
 
-- **Python 3.11+.** `pip install -e ".[dev]"`; add `.[serve]` for the smoke client.
-- **Day 4 runtime tools (not pip):** Docker, [kind](https://kind.sigs.k8s.io/), kubectl.
-- Serving is **CPU-only** — no GPU needed once the model is trained.
+- **Python 3.11+.** `pip install -e ".[dev]"`; add `.[gateway]` to run the gateway.
+- **Runtime tools (not pip):** Docker, kind, kubectl.
+- The gateway is **pure Python** (no native build); Redis + the model run as their own services.
 
 ---
 
-## Troubleshooting Day 4
+## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| Pod stuck `0/1`, logs show `[fetch] downloading` | Normal — downloading ~1.8 GB. Wait; watch `kubectl -n finbot logs -f`. |
-| `ImagePullBackOff` | You skipped `kind load docker-image`. |
-| `CrashLoopBackOff`, logs show a download error | `HF_TOKEN` missing/invalid or wrong `GGUF_REPO`/`GGUF_FILE`. |
-| `docker build` fails on `llama-cpp-python` | `python:3.11-slim` lacks a compiler — add `build-essential cmake` in the Dockerfile. |
-| `unrecognized arguments: --metrics` | `llama-cpp-python`'s server has no `--metrics` flag (that's the native server). Remove it; metrics are wired on Day 6. |
-| Config/secret edit didn't take effect | ConfigMap/Secret changes don't auto-restart pods: `kubectl -n finbot rollout restart deployment/finbot-model`. |
+| `/v1/generate` → 401 | Missing/wrong `Authorization: Bearer <GATEWAY_API_KEY>`. |
+| `/v1/generate` → 503 (`OVERLOADED`) | Backpressure — all backend permits busy. Expected under load. |
+| `/v1/generate` → 503 (`MODEL_UNAVAILABLE`) | Breaker open or connect failure — the model is down/restarting. |
+| `/readyz` → 503 | Redis unavailable (rate limiting can't be enforced). |
+| Gateway not scaling | HPA needs metrics-server installed in the cluster. |
 
 ---
 
 ## What each day proves
 
-- **Day 1:** PII scrubbing with a pipeline-failing leak check; versioned, schema-validated data.
-- **Day 2:** QLoRA on a small GPU; MLflow provenance; merged model + quantized GGUF shipped.
-- **Day 3:** an automated **quality gate** with a stricter safety bar and a versioned registry.
-- **Day 4:** the model as a **self-healing Kubernetes service** on CPU, OpenAI-compatible, with
-  startup/readiness/liveness probes and externalized config/secrets.
+- **Day 1–4:** versioned data, gated model, self-healing CPU serving.
+- **Day 5:** a **resilient application boundary** — the model is treated as an unreliable
+  dependency, and slowness/restarts degrade **predictably** (bounded waits, clean 503s, an
+  automatically-recovering circuit breaker) instead of cascading through the platform
 
 ---

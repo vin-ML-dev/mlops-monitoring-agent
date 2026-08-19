@@ -1,0 +1,21 @@
+# The diagram shows the gateway as "Pod + HPA". CPU utilization is a simple
+# starting signal for the I/O-light gateway. NOTE: raw CPU is a poor signal for
+# the MODEL (a busy inference worker is expected to be hot) — model scaling should
+# use queue-depth/latency later (Day 8). This HPA is for the GATEWAY only.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fastapi-gateway
+  namespace: finbot
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fastapi-gateway
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }

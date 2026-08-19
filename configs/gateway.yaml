@@ -1,0 +1,47 @@
+# Day 5 — FastAPI gateway config. All values are examples: measure real p95/p99 and
+# tune. The gateway treats the model as a slow, capacity-limited dependency.
+
+model:
+  base_url: "http://llama-cpp-svc:8080"     # Day 4 in-cluster model Service
+  chat_path: "/v1/chat/completions"
+
+timeouts:              # seconds — a BUDGET, not one number
+  connect: 2           # backend is local; connect should be quick
+  read: 90             # generation is slow; for streams = max inactivity between chunks
+  write: 5             # request body is small
+  pool: 1              # don't wait forever for a socket
+
+retry:
+  max_attempts: 2      # original + 1 retry only (conservative)
+  backoff_ms_min: 100
+  backoff_ms_max: 300
+
+concurrency:           # BACKPRESSURE — per gateway pod
+  max_backend: 4       # max concurrent calls to the model from THIS pod
+  queue_wait_seconds: 2  # wait this long for a permit, else return 503
+
+circuit_breaker:       # LOCAL to each process (not Redis-backed)
+  failure_threshold: 5   # consecutive backend failures -> open
+  open_seconds: 15       # stay open this long, then half-open
+  half_open_probes: 1    # probe requests allowed in half-open
+
+cache:                 # Redis; only deterministic responses
+  enabled: true
+  schema_version: "v1"
+  model_version: "finbot-1.0.0"   # bump on model rollout -> old keys ignored
+  ttl_seconds: 3600
+
+rate_limit:            # Redis; per-caller quota
+  enabled: true
+  requests_per_window: 30
+  window_seconds: 60
+
+validation:
+  max_messages: 32
+  max_message_chars: 8000
+  max_tokens_cap: 512
+
+redis:
+  url: "redis://redis-svc:6379/0"
+
+request_id_header: "X-Request-ID"
