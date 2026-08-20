@@ -1,0 +1,99 @@
+# Day-6 deterministic alert rules (Path 1). No LLM involved.
+# Expressions use the REAL metrics the Day-5 gateway emits + kube-state-metrics.
+#
+# Model health is detected WITHOUT the model's own /metrics:
+#   - ModelDown            -> kube-state-metrics (replicas available)
+#   - ModelDependencyUnhealthy -> the gateway's circuit-breaker gauge (caller-side)
+# so these work even though llama-cpp-python doesn't serve /metrics.
+#
+# TIP: the `job` label equals the Service name by default. Confirm in
+# Prometheus -> Status -> Targets and adjust the matchers if yours differ.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: finbot-alerts
+  namespace: finbot
+  labels:
+    release: kps
+spec:
+  groups:
+    # ---------- availability (down / breaker) ----------
+    - name: finbot.availability
+      rules:
+        - alert: GatewayDown
+          expr: up{job="fastapi-gateway-svc"} == 0
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "FastAPI gateway is down"
+            description: "Prometheus could not scrape the gateway for 1m (up==0)."
+
+        - alert: ModelDown
+          expr: kube_deployment_status_replicas_available{namespace="finbot",deployment="finbot-model"} == 0
+          for: 3m
+          labels: { severity: critical }
+          annotations:
+            summary: "Model has no available replicas"
+            description: "finbot-model has 0 available replicas for 1m — the model is down."
+
+        - alert: ModelDependencyUnhealthy
+          # gateway_circuit_breaker_state: 0=closed 1=half_open 2=open
+          expr: max(gateway_circuit_breaker_state) >= 2
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "Gateway circuit breaker OPEN"
+            description: "The gateway's breaker is open for 1m — the model dependency is failing (caller-side)."
+
+    # ---------- quality (errors / latency) ----------
+    - name: finbot.quality
+      rules:
+        - alert: HighBackendErrorRate
+          # ratio of failing model calls; clamp_min avoids divide-by-zero at idle
+          expr: |
+            sum(rate(gateway_backend_requests_total{outcome="error"}[5m]))
+            /
+            clamp_min(sum(rate(gateway_backend_requests_total[5m])), 1e-9)
+            > 0.02
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "High backend error rate (>2%)"
+            description: "More than 2% of model calls have failed over the last 5m."
+
+        - alert: HighLatencyDegraded
+          # public p95 request latency; threshold is a starting point — tune it
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(gateway_http_request_duration_seconds_bucket[5m])) by (le)
+            ) > 15
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "p95 latency > 15s (degraded)"
+            description: "Gateway p95 request latency exceeded 15s for 5m — reachable but slow."
+
+    # ---------- stability (restart churn) ----------
+    - name: finbot.stability
+      rules:
+        - alert: PodRestartChurn
+          expr: increase(kube_pod_container_status_restarts_total{namespace="finbot"}[15m]) > 3
+          for: 0m
+          labels: { severity: warning }
+          annotations:
+            summary: "Pod restart churn"
+            description: "A finbot pod restarted more than 3 times in 15m ({{ $labels.pod }})."
+
+    # ---------- agent dead-man switch (dormant until Day 7) ----------
+    - name: finbot.agent
+      rules:
+        - alert: AgentHeartbeatLost
+          # Day 7's LangGraph agent emits monitoring_agent_heartbeat_timestamp_seconds.
+          # This staleness form returns NO DATA (no alert) until that metric exists,
+          # so it is safe to ship now and activates automatically on Day 7.
+          expr: time() - max(monitoring_agent_heartbeat_timestamp_seconds) > 120
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "Monitoring agent not reporting"
+            description: "No agent heartbeat for >2m — the dead-man switch (activates on Day 7)."

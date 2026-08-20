@@ -1,115 +1,112 @@
 # finbot — a finance-education LLM platform (MLOps, end to end)
 
 A small **finance-education assistant** built the production way: curate data →
-fine-tune `Qwen/Qwen3-1.7B` (QLoRA) → gate it on quality → serve it in-cluster on CPU →
-**put a resilient gateway in front** → (next) monitor it. This repo covers **Days 1–5**.
+fine-tune (QLoRA) → gate on quality → serve in-cluster on CPU → resilient gateway →
+**deterministic monitoring**. This repo covers **Days 1–6**.
 
 ```
 Day 1  DATA     ingest → curate (quality + PII) → build → validate → split
 Day 2  TRAIN    QLoRA fine-tune → merge → push (model + GGUF) to the Hub
 Day 3  GATE     score the GGUF vs a golden set → pass/fail → register a version
 Day 4  SERVE    run the GGUF in-cluster on CPU (llama-cpp-svc)
-Day 5  GATEWAY  resilient FastAPI gateway + Redis in front of the model            ← this repo
-Day 6+ MONITOR  Prometheus + Alertmanager
+Day 5  GATEWAY  resilient FastAPI gateway + Redis (fastapi-gateway-svc)
+Day 6  MONITOR  Prometheus + Alertmanager + Grafana → Slack (Path 1, no LLM)        ← this repo
+Day 7+ AGENT    LangGraph explanation layer (Path 2) + dead-man switch (Node C)
 ```
 
 ---
 
-## Day 5 — the resilient gateway (this repo's focus)
+## Day 6 — deterministic monitoring (this repo's focus)
 
-Clients never call the model directly. A **FastAPI gateway** (Node A) treats the CPU model as a
-**slow, capacity-limited, failure-prone dependency** and makes failure **bounded, fast,
-observable, predictable, and contained**.
+Build the **reliable alerting core** — **Prometheus decides what's wrong, Alertmanager decides who's
+notified** — with **no LLM agent**. This is **Path 1** from the architecture: it must fire even if
+the Day-7 agent is dead.
 
 ```
-CLIENT → fastapi-gateway-svc:8000 → llama-cpp-svc:8080
-         auth · validation · request IDs · rate limit (Redis) · cache (Redis) ·
-         bounded concurrency · timeout budget · conservative retry ·
-         circuit breaker · SSE · /healthz /readyz /metrics
+Gateway /metrics ─┐
+(fastapi-gateway) │
+                  ├──> Prometheus ──> Alert Rules ──> Alertmanager ──> Slack   (Path 1)
+Model health ─────┘     (StatefulSet)                 (StatefulSet)
+(via gateway +               └──> Grafana (Deployment · dashboards)
+ kube-state-metrics)
 ```
 
-**What's implemented (every concept from the Day 5 theory guide)**
+**What's implemented**
 
-- **Auth** — API key, constant-time compare, never logged.
-- **Validation** — Pydantic + config caps (messages, length, max_tokens) reject bad requests
-  before they cost inference.
-- **Rate limiting** — Redis fixed-window per caller (keyed by a fingerprint, not the raw key);
-  `429` + `Retry-After`. Redis down → security-first `503`.
-- **Caching** — Redis, versioned canonical SHA-256 keys, **deterministic-only** (temp 0);
-  fail-open; invalidation by version prefix.
-- **Backpressure** — bounded per-pod concurrency to the model; no permit in time → `503`.
-- **Timeout budget** — connect/read/write/pool (not one magic number).
-- **Conservative retry** — at most one, transient pre-response failures only, never mid-stream.
-- **Circuit breaker** — local per-process `closed → open → half-open → closed`; counts backend
-  5xx, **not** client 4xx.
-- **Error taxonomy** — 401 / 422 / 429 / 503 / 504 / 500 with structured bodies (no stack traces).
-- **Observability** — `/healthz` (cheap, **model-independent** — no cascading restarts),
-  `/readyz` (Redis-aware), `/metrics` (gateway boundary instrumented separately from the model
-  boundary, ready for Day 6).
+- **kube-prometheus-stack**, trimmed for single-node kind (`monitoring/values-kind.yaml`) — Prometheus
+  + Alertmanager (StatefulSets) + Grafana (Deployment) + kube-state-metrics.
+- **Gateway ServiceMonitor** — Prometheus scrapes the Day-5 gateway's `/metrics`.
+- **Alert rules** (`monitoring/prometheus-rules.yaml`) wired to the **real** gateway metrics:
+  `GatewayDown`, `ModelDown`, `ModelDependencyUnhealthy` (breaker open), `HighBackendErrorRate`,
+  `HighLatencyDegraded`, `PodRestartChurn`, and `AgentHeartbeatLost` (dormant until Day 7).
+- **Alertmanager → Slack** — grouping, severity routing (warning vs critical), `repeat_interval`,
+  resolved messages; the webhook comes from a **Kubernetes Secret**.
+- **Grafana dashboard** — auto-loaded (request rate, p95, backend error ratio, breaker, cache, restarts).
 
-**Redis (`redis-svc`)** holds the cache + rate-limit state (agent state comes later). The circuit
-breaker stays **local** on purpose — a Redis outage can't disable protection.
+**Model health without the model's own `/metrics`.** The Day-4 model runs `llama-cpp-python`, which
+has **no `/metrics`**. So Day 6 detects the model from the **caller's side** — the gateway's backend
+error ratio + circuit-breaker gauge — plus **kube-state-metrics** (replicas available, pod restarts).
+Scraping the model directly is an optional file for when you switch to the native server (Day 8).
 
 ---
 
-## Run Day 5
+## Run Day 6 (needs Day 4 + Day 5 already deployed)
 
-**Locally (docker-compose — gateway + Redis):**
 ```bash
-export GATEWAY_API_KEY=dev-key
-make up                     # builds + runs gateway + redis
-# point the gateway at a reachable model (e.g. port-forward llama-cpp-svc)
+# install the stack
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts && helm repo update
+kubectl create ns monitoring
+export SLACK_WEBHOOK='https://hooks.slack.com/services/XXX/YYY/ZZZ'
+kubectl -n monitoring create secret generic alertmanager-slack --from-literal=webhook="$SLACK_WEBHOOK"
+helm install kps prometheus-community/kube-prometheus-stack -n monitoring -f monitoring/values-kind.yaml
+
+# wire finbot into monitoring
+kubectl -n finbot label svc fastapi-gateway-svc app=fastapi-gateway --overwrite
+kubectl apply -f monitoring/servicemonitor-gateway.yaml
+kubectl apply -f monitoring/prometheus-rules.yaml
+kubectl apply -f monitoring/grafana-dashboard.yaml
+
+# verify targets (Status -> Targets, expect up==1 for the gateway)
+kubectl -n monitoring port-forward svc/kps-kube-prometheus-prometheus 9090:9090
+
+# demo an alert
+kubectl -n finbot scale deployment/finbot-model --replicas=0    # -> ModelDown -> Slack
+kubectl -n finbot scale deployment/finbot-model --replicas=1    # -> recovery
 ```
 
-**On the cluster (needs Day 4's model already deployed):**
+*(Make equivalents: `make repo`, `make slack-secret`, `make install`, `make apply`, `make targets`,
+`make test-model-down`. See `make help`.)*
+
+**Offline (no cluster):**
 ```bash
-make gw-image && make gw-load          # build + load the gateway image into kind
-export GATEWAY_API_KEY=your-strong-key
-make gw-secret                         # API-key secret
-make gw-deploy                         # redis + gateway + service + hpa
-make gw-status                         # pods/svc/hpa
-make gw-forward &                      # localhost:8000 -> the gateway
-make gw-smoke                          # send a request through the gateway
-make gw-metrics                        # see the Prometheus metrics
+make test        # validates manifests, alert-rule completeness, dashboard JSON, and the values file
 ```
-
-**Offline (no cluster/Redis needed):**
-```bash
-make install && make test              # 18 unit tests: breaker, auth, cache, rate-limit, backpressure...
-```
-
----
-
-## Days 1–4 (recap — what the gateway fronts)
-
-**Day 1 — Data.** curate + two-layer PII scrub + a leak check that fails the pipeline; DVC + `data-v1`.
-**Day 2 — Fine-tune.** QLoRA on a 12 GB GPU, MLflow provenance, merged + q8_0 GGUF pushed.
-**Day 3 — Gate.** score the GGUF vs a frozen golden set; stricter safety bar; non-zero exit blocks;
-register `v1.0.0`.
-**Day 4 — Serve.** the GGUF as a self-healing Kubernetes service (`llama-cpp-svc`) on CPU,
-OpenAI-compatible, with startup/readiness/liveness probes.
 
 ---
 
 ## Repo layout
 
 ```
-src/gateway/      Day 5 — app / schemas / auth / model_client / cache / rate_limit /
-                          concurrency / circuit_breaker / errors / metrics / request_id
-gateway/          Day 5 — Dockerfile (the gateway image)
-deploy/           Day 5 — redis + gateway (configmap / secret / deployment / service / hpa)
-configs/          gateway.yaml (timeouts, retry, breaker, cache, rate-limit, validation)
-docs/             DAY5_THEORY_GUIDE.md
-tests/            offline tests (no cluster/Redis needed)
-docker-compose.yaml   local dev: gateway + redis
-Makefile          self-documenting targets (make help)
+monitoring/
+  values-kind.yaml                    kube-prometheus-stack values (trimmed for kind)
+  servicemonitor-gateway.yaml         scrape the gateway /metrics
+  servicemonitor-model.OPTIONAL.yaml  scrape the model (only with native server + --metrics)
+  prometheus-rules.yaml               the alert rules (Path 1)
+  alertmanager-slack-secret.example.yaml
+  grafana-dashboard.yaml              auto-loaded dashboard
+scripts/
+  loadtest.sh                         generate traffic to exercise latency alerts
+  trigger_alerts.md                   how to fire each alert for the demo
+docs/DAY6_GUIDE.md                    the full theory guide (diagram-matched)
+tests/test_monitoring.py              offline validation
+Makefile                              install / wire / verify / demo / teardown
 ```
 
 ## Requirements
 
-- **Python 3.11+.** `pip install -e ".[dev]"`; add `.[gateway]` to run the gateway.
-- **Runtime tools (not pip):** Docker, kind, kubectl.
-- The gateway is **pure Python** (no native build); Redis + the model run as their own services.
+- **Runtime tools (not pip):** helm, kubectl, kind — plus Day 4 (model) and Day 5 (gateway) running.
+- **Python:** only for the offline tests (`pip install -e ".[dev]"`).
+- On **single-node kind** everything co-locates; the Node A/B/C split is Day 8.
 
 ---
 
@@ -117,19 +114,29 @@ Makefile          self-documenting targets (make help)
 
 | Symptom | Cause / fix |
 |---|---|
-| `/v1/generate` → 401 | Missing/wrong `Authorization: Bearer <GATEWAY_API_KEY>`. |
-| `/v1/generate` → 503 (`OVERLOADED`) | Backpressure — all backend permits busy. Expected under load. |
-| `/v1/generate` → 503 (`MODEL_UNAVAILABLE`) | Breaker open or connect failure — the model is down/restarting. |
-| `/readyz` → 503 | Redis unavailable (rate limiting can't be enforced). |
-| Gateway not scaling | HPA needs metrics-server installed in the cluster. |
+| Gateway target missing in Prometheus | Label the Service: `kubectl -n finbot label svc fastapi-gateway-svc app=fastapi-gateway`. |
+| ServiceMonitor ignored | `serviceMonitorSelectorNilUsesHelmValues: false` must be set (it is in `values-kind.yaml`). |
+| `GatewayDown` never fires when it should | The `job` label may differ — check Prometheus → Status → Targets and adjust the rule matcher. |
+| No Slack messages | Webhook secret missing/wrong, or the channel doesn't exist. Check the Alertmanager pod logs. |
+| Stack won't schedule on kind | Reduce resources further in `values-kind.yaml`; give Docker more memory. |
+| False `ServiceDown` for the model | Don't apply the model ServiceMonitor unless the model actually serves `/metrics`. |
 
 ---
 
-## What each day proves
+## What each day proves (interview-ready)
 
-- **Day 1–4:** versioned data, gated model, self-healing CPU serving.
-- **Day 5:** a **resilient application boundary** — the model is treated as an unreliable
-  dependency, and slowness/restarts degrade **predictably** (bounded waits, clean 503s, an
-  automatically-recovering circuit breaker) instead of cascading through the platform
+- **Days 1–5:** versioned data, gated model, self-healing CPU serving, resilient gateway.
+- **Day 6:** **deterministic monitoring first** — Prometheus + PromQL rules detect down/degraded/
+  error/restart, Alertmanager groups/routes/repeats and posts to Slack, and it all works with **no
+  LLM**. Model health is inferred from caller-side signals when the model has no `/metrics`.
+
+## License
+
+Code: MIT (educational). Base model (`Qwen/Qwen3-1.7B`, Apache-2.0) and dataset carry their own
+licenses.
 
 ---
+
+**Next — Day 7:** the **LangGraph agent** (Node C) — **Path 2**: it reads the same Prometheus data,
+explains *why* an incident is happening in plain English to Slack, and emits a heartbeat that
+activates the Day-6 `AgentHeartbeatLost` dead-man switch. The agent **never** remediates.

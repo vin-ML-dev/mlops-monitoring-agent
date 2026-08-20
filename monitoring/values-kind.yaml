@@ -1,0 +1,103 @@
+# kube-prometheus-stack Helm values — trimmed for a single-node kind cluster.
+# Everything (model + gateway + redis + this stack) shares one laptop node, so we
+# shrink replicas/retention/resources. On Day 8's real 3 nodes, use defaults.
+
+fullnameOverride: kps
+
+# disable kube-prometheus-stack's built-in Kubernetes alert rules (keep only YOUR finbot rules)
+#defaultRules:
+  #create: false
+
+# --- disable control-plane scrape jobs that don't exist on kind (avoids noisy "target down") ---
+kubeControllerManager: { enabled: false }
+kubeScheduler:         { enabled: false }
+kubeProxy:             { enabled: false }
+kubeEtcd:              { enabled: false }
+
+# --- Prometheus (StatefulSet) ---
+prometheus:
+  prometheusSpec:
+    replicas: 1
+    retention: 6h
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+    # CRITICAL: discover OUR ServiceMonitors/PrometheusRules even without the Helm release label.
+    # Without these set to false, Prometheus only picks up objects labelled release=kps.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    resources:
+      requests: { cpu: 100m, memory: 400Mi }
+      limits:   { memory: 900Mi }
+    # ephemeral storage on kind (data is fine to lose locally; avoids PVC hassle)
+    # -> omit storageSpec so it uses emptyDir
+
+# --- Alertmanager (StatefulSet) — Path 1: the reliable Slack alerting path ---
+alertmanager:
+  alertmanagerSpec:
+    replicas: 1
+    resources:
+      requests: { cpu: 25m, memory: 64Mi }
+      limits:   { memory: 128Mi }
+    # mount the Slack webhook secret at /etc/alertmanager/secrets/alertmanager-slack/webhook
+    secrets:
+      - alertmanager-slack
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: slack-default
+      group_by: ["alertname", "severity", "namespace"]
+      group_wait: 30s          # batch related alerts before the first send
+      group_interval: 1m       # how often to send updates about a group
+      repeat_interval: 4h      # re-send a still-firing alert this often
+      routes:
+        - matchers: ['severity="critical"']
+          receiver: slack-critical
+          repeat_interval: 1h  # critical repeats more often
+    receivers:
+      - name: slack-default
+        slack_configs:
+          - channel: "#finbot-alerts"
+            send_resolved: true
+            api_url_file: /etc/alertmanager/secrets/alertmanager-slack/webhook
+            color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+            title: '{{ if eq .Status "firing" }}🔥 FIRING{{ else }}✅ RESOLVED{{ end }} · {{ .CommonLabels.alertname }} · {{ .CommonLabels.severity }}'
+            text: >-
+              *Status:* {{ .Status | toUpper }}
+              {{ range .Alerts }}
+              *{{ .Annotations.summary }}* {{ .Annotations.description }}
+              {{ end }}
+      - name: slack-critical
+        slack_configs:
+          - channel: "#finbot-alerts"
+            send_resolved: true
+            api_url_file: /etc/alertmanager/secrets/alertmanager-slack/webhook
+            color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+            title: >-
+              {{ if eq .Status "firing" }}🔥 [CRITICAL] FIRING · {{ .CommonLabels.alertname }}{{ else }}✅ [CRITICAL] RESOLVED · {{ .CommonLabels.alertname }}{{ end }}
+            text: >-
+              {{ if eq .Status "firing" }}*Model is DOWN* — finbot-model has no available replicas.{{ else }}*Model is UP again* — finbot-model has available replicas again.{{ end }}
+
+# --- Grafana (Deployment) — human dashboards, optional ---
+grafana:
+  enabled: false
+  adminPassword: admin           # LOCAL ONLY — change / use a secret in production
+  defaultDashboardsEnabled: true
+  resources:
+    requests: { cpu: 25m, memory: 128Mi }
+    limits:   { memory: 384Mi }
+  # auto-load dashboards from ConfigMaps labelled grafana_dashboard=1
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+
+# --- keep kube-state-metrics (pod restart signals) + node-exporter, small ---
+kube-state-metrics:
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+prometheus-node-exporter:
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }

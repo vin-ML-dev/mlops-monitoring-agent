@@ -1,0 +1,21 @@
+# Tells Prometheus to scrape the FastAPI gateway's /metrics.
+# NOTE: the ServiceMonitor selects the SERVICE by its metadata labels, so the
+# gateway Service must carry `app: fastapi-gateway`. If it doesn't yet:
+#   kubectl -n finbot label svc fastapi-gateway-svc app=fastapi-gateway --overwrite
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fastapi-gateway
+  namespace: finbot
+  labels:
+    release: kps            # harmless; helps if selector-by-release is ever re-enabled
+spec:
+  namespaceSelector:
+    matchNames: ["finbot"]
+  selector:
+    matchLabels:
+      app: fastapi-gateway
+  endpoints:
+    - port: http           # the Service's port NAME (8000) from Day 5
+      path: /metrics
+      interval: 15s

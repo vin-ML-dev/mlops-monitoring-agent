@@ -1,0 +1,60 @@
+# A minimal finbot dashboard, auto-loaded by the Grafana sidecar (label grafana_dashboard=1).
+# Panels use the REAL Day-5 gateway metrics + kube-state-metrics.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: finbot-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  finbot.json: |
+    {
+      "title": "finbot — gateway & model",
+      "uid": "finbot-day6",
+      "schemaVersion": 39,
+      "time": { "from": "now-1h", "to": "now" },
+      "refresh": "30s",
+      "panels": [
+        {
+          "type": "timeseries", "title": "Gateway request rate (req/s)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "targets": [
+            { "expr": "sum(rate(gateway_http_requests_total[5m]))", "legendFormat": "requests/s" }
+          ]
+        },
+        {
+          "type": "timeseries", "title": "Gateway p95 latency (s)",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "targets": [
+            { "expr": "histogram_quantile(0.95, sum(rate(gateway_http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95" }
+          ]
+        },
+        {
+          "type": "timeseries", "title": "Backend error ratio",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "targets": [
+            { "expr": "sum(rate(gateway_backend_requests_total{outcome=\"error\"}[5m])) / clamp_min(sum(rate(gateway_backend_requests_total[5m])), 1e-9)", "legendFormat": "error ratio" }
+          ]
+        },
+        {
+          "type": "stat", "title": "Circuit breaker (0=closed 1=half 2=open)",
+          "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 },
+          "targets": [ { "expr": "max(gateway_circuit_breaker_state)" } ]
+        },
+        {
+          "type": "stat", "title": "Cache hit ratio",
+          "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
+          "targets": [
+            { "expr": "sum(rate(gateway_cache_requests_total{result=\"hit\"}[5m])) / clamp_min(sum(rate(gateway_cache_requests_total[5m])), 1e-9)" }
+          ]
+        },
+        {
+          "type": "timeseries", "title": "Pod restarts (finbot ns, 15m)",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+          "targets": [
+            { "expr": "increase(kube_pod_container_status_restarts_total{namespace=\"finbot\"}[15m])", "legendFormat": "{{pod}}" }
+          ]
+        }
+      ]
+    }
