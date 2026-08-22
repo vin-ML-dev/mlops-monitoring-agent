@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monitoring-agent
+  namespace: finbot
+  labels: { app: monitoring-agent }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: monitoring-agent }
+  template:
+    metadata:
+      labels: { app: monitoring-agent }
+    spec:
+      # On Day 8's real cluster, pin to Node C (own node) + anti-affinity from model/gateway.
+      # nodeSelector: { node-role: monitoring-agent }
+      containers:
+        - name: agent
+          image: monitoring-agent:v1.0.0     # built locally + loaded into kind
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9108
+          envFrom:
+            - configMapRef: { name: agent-config }
+          env:
+            - name: SLACK_WEBHOOK
+              valueFrom:
+                secretKeyRef: { name: agent-secret, key: SLACK_WEBHOOK }
+            - name: GATEWAY_API_KEY
+              valueFrom:
+                secretKeyRef: { name: agent-secret, key: GATEWAY_API_KEY }
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agent-secret
+                  key: OPENAI_API_KEY
+                  optional: true
+          resources:
+            requests: { cpu: "25m", memory: "96Mi" }
+            limits:   { memory: "256Mi" }
+          # liveness = the agent process is alive (metrics server responds).
+          # NOTE: this is NOT the dead-man switch — Prometheus watches the heartbeat metric.
+          livenessProbe:
+            httpGet: { path: /metrics, port: 9108 }
+            initialDelaySeconds: 15
+            periodSeconds: 20

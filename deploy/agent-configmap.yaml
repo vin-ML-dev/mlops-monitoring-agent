@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-config
+  namespace: finbot
+data:
+  # non-secret overrides (the app also reads configs/agent.yaml baked into the image)
+  PROMETHEUS_URL: "http://kps-prometheus.monitoring:9090"

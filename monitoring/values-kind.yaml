@@ -4,9 +4,27 @@
 
 fullnameOverride: kps
 
-# disable kube-prometheus-stack's built-in Kubernetes alert rules (keep only YOUR finbot rules)
-#defaultRules:
-  #create: false
+# ---------------------------------------------------------------------------
+# Silence the chart's BUILT-IN Kubernetes alert rules and keep ONLY your finbot
+# rules. On single-node kind these built-ins misfire constantly (e.g.
+# KubeAPIErrorBudgetBurn, KubePodCrashLooping, TargetDown) because there's no real
+# API error budget / control plane to measure. `create: false` removes ALL ~40 of
+# them, which also removes the "Watchdog" always-firing heartbeat — fine locally
+# (you have no external monitor watching Watchdog anyway). Re-enable on Day 8.
+#
+# TOP LEVEL — zero indent, a sibling of alertmanager:/prometheus:. NOT nested.
+defaultRules:
+  create: false
+#
+# --- Surgical alternative (keep Watchdog + useful rules, drop only the noisy
+#     apiserver SLO/burn-rate rules that cause KubeAPIErrorBudgetBurn) ---
+# defaultRules:
+#   create: true
+#   rules:
+#     kubeApiserverSlos: false
+#     kubeApiserverBurnrate: false
+#     kubeApiserverAvailability: false
+#     kubeApiserverHistogram: false
 
 # --- disable control-plane scrape jobs that don't exist on kind (avoids noisy "target down") ---
 kubeControllerManager: { enabled: false }
@@ -34,6 +52,16 @@ prometheus:
     # -> omit storageSpec so it uses emptyDir
 
 # --- Alertmanager (StatefulSet) — Path 1: the reliable Slack alerting path ---
+#
+# LESSON baked into the templates below:
+#   * a RULE annotation describes the CONDITION and is state-agnostic — the same
+#     text is sent whether firing OR resolved (it's written in a "firing" voice).
+#   * only the TEMPLATE knows .Status, so ALL state-dependent wording — the
+#     FIRING/RESOLVED label AND the body — must live here and be gated on .Status.
+#   Printing a raw "…is down" description on resolve is what produced the
+#   "RESOLVED · … the agent is down" contradiction. The `if eq .Status "firing"`
+#   guards below fix that for every alert at once.
+#   Keep each template on ONE line (single-quoted) so no stray newlines leak.
 alertmanager:
   alertmanagerSpec:
     replicas: 1
@@ -64,30 +92,27 @@ alertmanager:
             api_url_file: /etc/alertmanager/secrets/alertmanager-slack/webhook
             color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
             title: '{{ if eq .Status "firing" }}🔥 FIRING{{ else }}✅ RESOLVED{{ end }} · {{ .CommonLabels.alertname }} · {{ .CommonLabels.severity }}'
-            text: >-
-              *Status:* {{ .Status | toUpper }}
-              {{ range .Alerts }}
-              *{{ .Annotations.summary }}* {{ .Annotations.description }}
-              {{ end }}
+            text: '{{ if eq .Status "firing" }}{{ range .Alerts }}*{{ .Annotations.summary }}* — {{ .Annotations.description }}{{ "\n" }}{{ end }}{{ else }}✅ Recovered — the condition has cleared.{{ end }}'
       - name: slack-critical
         slack_configs:
           - channel: "#finbot-alerts"
             send_resolved: true
             api_url_file: /etc/alertmanager/secrets/alertmanager-slack/webhook
             color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
-            title: >-
-              {{ if eq .Status "firing" }}🔥 [CRITICAL] FIRING · {{ .CommonLabels.alertname }}{{ else }}✅ [CRITICAL] RESOLVED · {{ .CommonLabels.alertname }}{{ end }}
-            text: >-
-              {{ if eq .Status "firing" }}*Model is DOWN* — finbot-model has no available replicas.{{ else }}*Model is UP again* — finbot-model has available replicas again.{{ end }}
+            title: '{{ if eq .Status "firing" }}🔥 [CRITICAL] FIRING{{ else }}✅ [CRITICAL] RESOLVED{{ end }} · {{ range .Alerts }}{{ .Labels.alertname }}{{ end }}'
+            text: '{{ if eq .Status "firing" }}{{ range .Alerts }}{{ .Annotations.description }}{{ "\n" }}{{ end }}{{ else }}✅ Recovered — the condition has cleared.{{ end }}'
 
 # --- Grafana (Deployment) — human dashboards, optional ---
+# Disabled locally: on kind it OOM-killed at 384Mi. Re-enable on Day 8 (real nodes)
+# or bump the limit to ~512Mi if you want it locally. Leftover config below is
+# ignored while enabled=false — kept so re-enabling is a one-line change.
 grafana:
   enabled: false
   adminPassword: admin           # LOCAL ONLY — change / use a secret in production
   defaultDashboardsEnabled: true
   resources:
     requests: { cpu: 25m, memory: 128Mi }
-    limits:   { memory: 384Mi }
+    limits:   { memory: 512Mi }  # was 384Mi -> OOM-killed; give it more headroom
   # auto-load dashboards from ConfigMaps labelled grafana_dashboard=1
   sidecar:
     dashboards:

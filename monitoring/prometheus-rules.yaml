@@ -91,9 +91,12 @@ spec:
           # Day 7's LangGraph agent emits monitoring_agent_heartbeat_timestamp_seconds.
           # This staleness form returns NO DATA (no alert) until that metric exists,
           # so it is safe to ship now and activates automatically on Day 7.
-          expr: time() - max(monitoring_agent_heartbeat_timestamp_seconds) > 120
+          expr: >
+            absent(monitoring_agent_heartbeat_timestamp_seconds)
+            or (time() - max(monitoring_agent_heartbeat_timestamp_seconds) > 120)
+
           for: 1m
           labels: { severity: critical }
           annotations:
             summary: "Monitoring agent not reporting"
-            description: "No agent heartbeat for >2m — the dead-man switch (activates on Day 7)."
+            description: "No agent heartbeat for over 2 minutes — the agent is down, crashed, or stuck."

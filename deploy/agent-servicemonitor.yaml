@@ -1,0 +1,19 @@
+# Prometheus scrapes the agent's /metrics so it sees the heartbeat gauge
+# `monitoring_agent_heartbeat_timestamp_seconds`. When the agent dies, that metric
+# goes stale and the Day-6 AgentHeartbeatLost rule fires via Alertmanager.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: monitoring-agent
+  namespace: finbot
+  labels: { release: kps }
+spec:
+  namespaceSelector:
+    matchNames: ["finbot"]
+  selector:
+    matchLabels:
+      app: monitoring-agent
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s

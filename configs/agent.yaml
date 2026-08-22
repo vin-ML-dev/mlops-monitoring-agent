@@ -1,0 +1,43 @@
+# Day 7 — LangGraph monitoring agent (Node C). Reads Prometheus, probes services,
+# detects deterministically (SAME thresholds as Day 6), and uses the LLM only to
+# EXPLAIN. It never remediates.
+
+prometheus:
+  base_url: "http://kps-prometheus.monitoring:9090"
+
+gateway:
+  base_url: "http://fastapi-gateway-svc:8000"    # Day 5
+model:
+  base_url: "http://llama-cpp-svc:8080"          # Day 4
+
+redis:
+  url: "redis://redis-svc:6379/1"                # db 1 = agent state (gateway uses db 0)
+
+# thresholds MIRROR the Day-6 alert rules so the two layers never disagree
+thresholds:
+  p95_latency_seconds: 15
+  backend_error_ratio: 0.02
+  breaker_open_value: 2       # gateway_circuit_breaker_state: 2 = open
+  pod_restarts_15m: 3
+
+schedule:
+  poll_interval_seconds: 60
+  canary_interval_seconds: 1800    # ~30 min (real inference, so less frequent)
+  daily_hour_utc: 8                # 08:00 UTC daily report
+
+cooldown_seconds: 900              # 15 min: don't re-explain the same open incident
+
+llm:
+  backend: "openai"              # template | ollama | openai (template = no external LLM)
+  # ollama:
+  #   base_url: "http://ollama:11434"
+  #   model: "llama3.2:1b"
+  openai:
+    base_url: "https://api.openai.com/v1"
+    model: "gpt-4.1-mini"
+    api_key_env: "OPENAI_API_KEY"
+
+canary:
+  api_key_env: "GATEWAY_API_KEY"
+
+metrics_port: 9108                 # Prometheus scrapes the heartbeat here

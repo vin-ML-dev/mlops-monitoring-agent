@@ -1,8 +1,8 @@
 # finbot — a finance-education LLM platform (MLOps, end to end)
 
-A small **finance-education assistant** built the production way: curate data →
-fine-tune (QLoRA) → gate on quality → serve in-cluster on CPU → resilient gateway →
-**deterministic monitoring**. This repo covers **Days 1–6**.
+A finance-education assistant built the production way: curate data → fine-tune (QLoRA) → gate →
+serve on CPU → resilient gateway → deterministic monitoring → **an LLM explanation layer**. This
+repo covers **Days 1–7**.
 
 ```
 Day 1  DATA     ingest → curate (quality + PII) → build → validate → split
@@ -10,103 +10,243 @@ Day 2  TRAIN    QLoRA fine-tune → merge → push (model + GGUF) to the Hub
 Day 3  GATE     score the GGUF vs a golden set → pass/fail → register a version
 Day 4  SERVE    run the GGUF in-cluster on CPU (llama-cpp-svc)
 Day 5  GATEWAY  resilient FastAPI gateway + Redis (fastapi-gateway-svc)
-Day 6  MONITOR  Prometheus + Alertmanager + Grafana → Slack (Path 1, no LLM)        ← this repo
-Day 7+ AGENT    LangGraph explanation layer (Path 2) + dead-man switch (Node C)
+Day 6  MONITOR  Prometheus + Alertmanager → Slack   (Path 1 · reliable · no LLM)
+Day 7  AGENT    LangGraph agent → LLM → Slack        (Path 2 · explanation)          ← this repo
+Day 8  DEPLOY   3-node Kubernetes/GitOps (Node A/B/C)
 ```
 
 ---
 
-## Day 6 — deterministic monitoring (this repo's focus)
+## Day 7 — the monitoring agent (this repo's focus)
 
-Build the **reliable alerting core** — **Prometheus decides what's wrong, Alertmanager decides who's
-notified** — with **no LLM agent**. This is **Path 1** from the architecture: it must fire even if
-the Day-7 agent is dead.
+A **LangGraph agent** (Node C) sits on top of Day 6 as an **explanation layer** — a second,
+**independent** Slack path. It never replaces Day 6 and never remediates.
 
 ```
-Gateway /metrics ─┐
-(fastapi-gateway) │
-                  ├──> Prometheus ──> Alert Rules ──> Alertmanager ──> Slack   (Path 1)
-Model health ─────┘     (StatefulSet)                 (StatefulSet)
-(via gateway +               └──> Grafana (Deployment · dashboards)
- kube-state-metrics)
+Path 1 (Day 6):  Prometheus → Alertmanager → Slack                 (works even if the agent is DOWN)
+Path 2 (Day 7):  Prometheus → LangGraph agent → LLM → Slack        (enriched "why")
+Safety:          agent heartbeat → Prometheus → Alertmanager → Slack if stale (dead-man switch)
 ```
 
-**What's implemented**
+### Both paths, live in Slack
 
-- **kube-prometheus-stack**, trimmed for single-node kind (`monitoring/values-kind.yaml`) — Prometheus
-  + Alertmanager (StatefulSets) + Grafana (Deployment) + kube-state-metrics.
-- **Gateway ServiceMonitor** — Prometheus scrapes the Day-5 gateway's `/metrics`.
-- **Alert rules** (`monitoring/prometheus-rules.yaml`) wired to the **real** gateway metrics:
-  `GatewayDown`, `ModelDown`, `ModelDependencyUnhealthy` (breaker open), `HighBackendErrorRate`,
-  `HighLatencyDegraded`, `PodRestartChurn`, and `AgentHeartbeatLost` (dormant until Day 7).
-- **Alertmanager → Slack** — grouping, severity routing (warning vs critical), `repeat_interval`,
-  resolved messages; the webhook comes from a **Kubernetes Secret**.
-- **Grafana dashboard** — auto-loaded (request rate, p95, backend error ratio, breaker, cache, restarts).
+![Both Slack paths firing for one model outage](docs/slack_msg.png)
 
-**Model health without the model's own `/metrics`.** The Day-4 model runs `llama-cpp-python`, which
-has **no `/metrics`**. So Day 6 detects the model from the **caller's side** — the gateway's backend
-error ratio + circuit-breaker gauge — plus **kube-state-metrics** (replicas available, pod restarts).
-Scraping the model directly is an optional file for when you switch to the native server (Day 8).
+A single model outage, as it actually landed in `#finbot-alerts`:
+
+- **11:34 — Path 2 (agent), fast.** `[AGENT] DOWN · model_down` with a plain-English explanation.
+  The agent's active probe caught the model as *unreachable* within one ~60s cycle — even though
+  the pod still reported a replica (metrics showed normal latency / no errors).
+- **11:41 — Path 1 (Alertmanager), slow-and-trustworthy.** `🔥 [CRITICAL] FIRING · ModelDown` —
+  only after the replica count hit 0 and the rule's `for:` window elapsed. The ~7-minute gap is the
+  whole reason there are two paths: instantaneous explanation vs. sustained, confirmed alert.
+- **11:49 — Path 1 RESOLVED, correct body.** `✅ [CRITICAL] RESOLVED · ModelDown — Recovered, the
+  condition has cleared.` — the state-gated template working: a resolved message no longer prints
+  the firing-voice "is down" text.
+- **`[AGENT] quality canary regression`** — the deterministic canary failing (the model couldn't
+  produce the expected refusal), with the LLM explaining *why*.
+
+**What's implemented (matching the Day-7 guide)**
+
+- **Fixed PromQL** (`prometheus_client.py`) — the same signals Day 6 uses; never LLM-generated.
+- **Active probes** (`probes.py`) — gateway `/healthz` + model `/v1/models` to tell **slow** from **down**.
+  These probes catch in-cluster reachability failures the replica-count metric can't see (see below).
+- **Deterministic detection** (`detect.py`) — `healthy` / `degraded` / `down` using the **same
+  thresholds as Day 6**. No LLM in detection.
+- **Correlation + cooldown** (`correlate.py` + Redis `incident_store.py`) — new / still-open /
+  recovered, so the same outage isn't re-explained every minute.
+- **LLM explains only** (`llm.py`) — new incidents, canary regressions, daily summaries. Backends:
+  `template` (no external LLM, default), `ollama`, `openai`. **Zero LLM calls on a healthy poll.**
+- **Deterministic quality canary** (`canary.py`) — known prompts through the **real gateway**, scored
+  deterministically (keyword / refusal); catches an **up-but-wrong** model. LLM only explains failures.
+- **Heartbeat** (`heartbeat.py`) — emits `monitoring_agent_heartbeat_timestamp_seconds` every cycle,
+  the **exact metric the Day-6 `AgentHeartbeatLost` rule watches** — so shipping this activates that
+  dormant dead-man switch. The agent never watches its own heartbeat.
+- **LangGraph graph** (`graph.py`) — `fetch_metrics → probe → detect → {correlate→diagnose | canary |
+  daily} → notify → persist`, plus a `pipeline.py` sequential runner (identical behaviour, used by tests).
+- **Own Deployment (Node C)** — separate from gateway/model, with a liveness probe.
+
+**The agent NEVER remediates** — it observes, explains, notifies. Kubernetes self-heals; a human acts.
 
 ---
 
-## Run Day 6 (needs Day 4 + Day 5 already deployed)
+## Prerequisites
+
+- **Runtime tools (not pip):** Docker, kind, kubectl, helm.
+- **Days 4–6 already running:** model (`llama-cpp-svc`), gateway (`fastapi-gateway-svc`), Redis
+  (`redis-svc`), and the kube-prometheus-stack (`kps`, namespace `monitoring`).
+- **Give Docker ≥ 8 GB RAM.** The whole stack on one kind node is heavy; too little memory makes the
+  kube API server drop with `EOF` / `connection reset`. If that happens, `docker restart
+  finbot-control-plane` (keeps the cluster) and re-create port-forwards.
+- Namespaces: app = **`finbot`**, monitoring = **`monitoring`**. kind cluster = **`finbot`**.
+- Helm release **`kps`** → services **`kps-prometheus`**, **`kps-alertmanager`** (use these for
+  port-forwards, NOT the `*-operated` headless ones).
+
+---
+
+## Run Day 7 (needs Days 4–6 running, model-first order)
 
 ```bash
-# install the stack
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts && helm repo update
-kubectl create ns monitoring
+make image && make load                    # build + load the agent image into kind
 export SLACK_WEBHOOK='https://hooks.slack.com/services/XXX/YYY/ZZZ'
-kubectl -n monitoring create secret generic alertmanager-slack --from-literal=webhook="$SLACK_WEBHOOK"
-helm install kps prometheus-community/kube-prometheus-stack -n monitoring -f monitoring/values-kind.yaml
-
-# wire finbot into monitoring
-kubectl -n finbot label svc fastapi-gateway-svc app=fastapi-gateway --overwrite
-kubectl apply -f monitoring/servicemonitor-gateway.yaml
-kubectl apply -f monitoring/prometheus-rules.yaml
-kubectl apply -f monitoring/grafana-dashboard.yaml
-
-# verify targets (Status -> Targets, expect up==1 for the gateway)
-kubectl -n monitoring port-forward svc/kps-kube-prometheus-prometheus 9090:9090
-
-# demo an alert
-kubectl -n finbot scale deployment/finbot-model --replicas=0    # -> ModelDown -> Slack
-kubectl -n finbot scale deployment/finbot-model --replicas=1    # -> recovery
+export GATEWAY_API_KEY='your-strong-key'   # must match the gateway's key (canary uses it)
+make secret                                # agent secret (SLACK_WEBHOOK + GATEWAY_API_KEY)
+make deploy                                # configmap + deployment + service (Node C)
+make monitor                               # Prometheus scrapes the heartbeat (ARMS the dead-man switch)
+make status && make logs                   # watch cycles + explanations
 ```
 
-*(Make equivalents: `make repo`, `make slack-secret`, `make install`, `make apply`, `make targets`,
-`make test-model-down`. See `make help`.)*
-
-**Offline (no cluster):**
+**Offline (no cluster/LLM/Slack):**
 ```bash
-make test        # validates manifests, alert-rule completeness, dashboard JSON, and the values file
+make install && make test                  # 19 tests: detect, correlate/cooldown, canary, pipeline, heartbeat
 ```
+
+**LLM backend:** default `template` (heuristic text, zero external cost). Switch to `ollama` or
+`openai` in `configs/agent.yaml` for richer wording — detection stays deterministic either way. To
+keep the diagram's "no external model API" property, point the `openai` backend at your in-cluster
+`llama-cpp-svc:8080/v1` instead of an external API.
+
+---
+
+## Verify everything works
+
+Port-forward the three UIs (each in its own terminal, or background with `&`):
+```bash
+kubectl -n monitoring port-forward svc/kps-prometheus       9090:9090 &
+kubectl -n monitoring port-forward svc/kps-alertmanager     9093:9093 &
+kubectl -n finbot     port-forward svc/monitoring-agent-svc 9108:9108 &
+```
+
+**1. Agent is cycling + heartbeat is fresh**
+```bash
+curl -s http://localhost:9108/metrics | grep -E 'agent_heartbeat|agent_cycles_total|monitoring_agent_heartbeat_timestamp_seconds'
+```
+Expect `agent_heartbeat 1.0`, a recent timestamp, and `agent_cycles_total` climbing.
+
+**2. Prometheus is scraping the agent (dead-man switch armed)**
+```bash
+# target up?
+curl -s http://localhost:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.job=="monitoring-agent-svc") | .health'
+# staleness the rule evaluates — want a small number (< 120), sawtooths 0→60 while healthy
+curl -s 'http://localhost:9090/api/v1/query?query=time()-max(monitoring_agent_heartbeat_timestamp_seconds)' | jq -r '.data.result[0].value[1]'
+```
+
+**3. Only your finbot rules exist (built-in noise silenced)**
+```bash
+curl -s http://localhost:9090/api/v1/rules | jq -r '.data.groups[].rules[].name' \
+  | grep -iE 'KubeAPIErrorBudgetBurn|Watchdog' && echo "STILL THERE" || echo "clean (built-ins gone)"
+```
+
+**4. Alertmanager templates are state-aware (no title/body contradiction)**
+```bash
+curl -s http://localhost:9093/api/v2/status | jq -r '.config.original' \
+  | grep -A25 '^- name: slack-critical' | grep -E 'title:|text:'   # both must contain: if eq .Status "firing"
+```
+
+### The three proof tests
+
+**Test 1 — kill the model → BOTH paths fire independently**
+```bash
+# watch alert state transitions live:
+watch -n5 "curl -s http://localhost:9090/api/v1/alerts | jq -r '.data.alerts[] | .labels.alertname + \"  \" + .state'"
+# in another terminal — leave it down 2–3 min so ModelDown crosses its `for:` window:
+kubectl -n finbot scale deploy/finbot-model --replicas=0
+```
+Expect exactly two Slack messages: `[AGENT] DOWN · model_down` (fast, ~60s) and, minutes later,
+`[CRITICAL] FIRING · ModelDown`. Recover and confirm the RESOLVED body reads the generic
+"✅ Recovered — the condition has cleared":
+```bash
+kubectl -n finbot scale deploy/finbot-model --replicas=1
+kubectl -n finbot rollout status deploy/finbot-model
+```
+
+**Test 2 — kill the agent → dead-man switch fires (the strongest test)**
+```bash
+watch -n5 "curl -s 'http://localhost:9090/api/v1/query?query=time()-max(monitoring_agent_heartbeat_timestamp_seconds)' | jq -r '.data.result[0].value[1]'"
+kubectl -n finbot scale deploy/monitoring-agent --replicas=0
+```
+Day-6 alerts keep working; after the heartbeat goes stale, Alertmanager sends
+`[CRITICAL] FIRING · AgentHeartbeatLost` with body "No agent heartbeat for over 2 minutes…". Recover:
+```bash
+kubectl -n finbot scale deploy/monitoring-agent --replicas=1
+```
+
+**Test 3 — quality regression → canary fails deterministically → LLM explains**
+```bash
+kubectl -n finbot logs -l app=monitoring-agent -f   # watch for "quality canary regression" on the next canary cycle
+```
+
+---
+
+## Shut down / start up the cluster
+
+**Pause work without losing anything** (stops the containers; your cluster + data persist):
+```bash
+docker stop finbot-control-plane
+# later, resume:
+docker start finbot-control-plane
+sleep 90 && kubectl get nodes                 # wait for the API server, expect Ready
+# port-forwards die on stop — re-create them (see Verify section)
+pkill -f 'port-forward'
+```
+
+> After any restart the model re-downloads its GGUF into `emptyDir`, so it can briefly refuse
+> connections (`Connection refused`) even while the pod shows `1/1 Running`. The agent will report
+> `model_down` until it's Ready again — expected; the Day-8 PVC fixes this.
+
+**Tear down the finbot app only** (keep the monitoring stack + cluster):
+```bash
+make undeploy                                 # remove the agent (Node C)
+kubectl -n finbot delete secret agent-secret --ignore-not-found
+kubectl -n finbot delete -f deploy/ --ignore-not-found   # gateway/model/redis (Day 4/5 manifests)
+```
+
+**Full teardown** (everything, including the cluster — frees all resources):
+```bash
+helm uninstall kps -n monitoring              # remove Prometheus + Alertmanager + Grafana
+kind delete cluster --name finbot             # delete the whole cluster
+pkill -f 'port-forward'                        # clean up any lingering forwards
+```
+
+---
+
+## Lessons learned proving Day 7 live (worth teaching)
+
+- **A staleness alert must also handle *absence*.** Scaling the agent to 0 deletes the pod, so its
+  metric *disappears* rather than going stale — `time() - max(<empty>) > 120` never fires. The rule
+  needs `absent(monitoring_agent_heartbeat_timestamp_seconds) or (time() - max(...) > 120)`.
+- **A rule annotation is state-agnostic; only the Alertmanager template knows `.Status`.** Any
+  firing-voice wording ("is down") in the *body* must be gated on `.Status`, or a RESOLVED message
+  reads "RESOLVED · … the agent is down." Gate title **and** body.
+- **A shared receiver template runs for every alert routed to it.** Never hardcode one alert's text;
+  print `{{ .Annotations.description }}` so each alert speaks for itself.
+- **`1/1 Running` is not proof a service works.** The agent's active probe caught a real
+  `Connection refused` that both the pod status and the replica-count alert missed.
+- **The two paths legitimately disagree on brief events, by design.** The agent reacts to the
+  *instantaneous* state every ~60s; Alertmanager only fires after the condition is *sustained* past
+  the rule's `for:` window (and, for `ModelDown`, after readiness failures drop the replica count).
+  Fast-and-chatty vs. slow-and-trustworthy.
+- **Give the kind node enough RAM.** API-server `EOF`/`connection reset` on a laptop is almost always
+  memory pressure; `docker restart finbot-control-plane` recovers without data loss.
 
 ---
 
 ## Repo layout
 
 ```
-monitoring/
-  values-kind.yaml                    kube-prometheus-stack values (trimmed for kind)
-  servicemonitor-gateway.yaml         scrape the gateway /metrics
-  servicemonitor-model.OPTIONAL.yaml  scrape the model (only with native server + --metrics)
-  prometheus-rules.yaml               the alert rules (Path 1)
-  alertmanager-slack-secret.example.yaml
-  grafana-dashboard.yaml              auto-loaded dashboard
-scripts/
-  loadtest.sh                         generate traffic to exercise latency alerts
-  trigger_alerts.md                   how to fire each alert for the demo
-docs/DAY6_GUIDE.md                    the full theory guide (diagram-matched)
-tests/test_monitoring.py              offline validation
-Makefile                              install / wire / verify / demo / teardown
+src/agent/
+  prometheus_client.py  fixed PromQL          detect.py       deterministic classify (Day-6 thresholds)
+  probes.py             reachability          correlate.py    new/open/recovered + cooldown
+  incident_store.py     Redis agent state     canary.py       deterministic quality scoring
+  llm.py                explainer backends    heartbeat.py    dead-man-switch metric + /metrics
+  nodes.py              node functions        pipeline.py     sequential runner (testable)
+  graph.py              LangGraph StateGraph   runner.py       scheduler + main loop
+agent/Dockerfile        the agent image
+deploy/                 Node C: configmap / secret / deployment / service / servicemonitor
+configs/agent.yaml      thresholds (mirror Day 6), schedule, cooldown, llm backend
+docs/DAY7_GUIDE.md      the theory guide
+tests/test_agent.py     offline tests
 ```
-
-## Requirements
-
-- **Runtime tools (not pip):** helm, kubectl, kind — plus Day 4 (model) and Day 5 (gateway) running.
-- **Python:** only for the offline tests (`pip install -e ".[dev]"`).
-- On **single-node kind** everything co-locates; the Node A/B/C split is Day 8.
 
 ---
 
@@ -114,29 +254,13 @@ Makefile                              install / wire / verify / demo / teardown
 
 | Symptom | Cause / fix |
 |---|---|
-| Gateway target missing in Prometheus | Label the Service: `kubectl -n finbot label svc fastapi-gateway-svc app=fastapi-gateway`. |
-| ServiceMonitor ignored | `serviceMonitorSelectorNilUsesHelmValues: false` must be set (it is in `values-kind.yaml`). |
-| `GatewayDown` never fires when it should | The `job` label may differ — check Prometheus → Status → Targets and adjust the rule matcher. |
-| No Slack messages | Webhook secret missing/wrong, or the channel doesn't exist. Check the Alertmanager pod logs. |
-| Stack won't schedule on kind | Reduce resources further in `values-kind.yaml`; give Docker more memory. |
-| False `ServiceDown` for the model | Don't apply the model ServiceMonitor unless the model actually serves `/metrics`. |
+| `AgentHeartbeatLost` never fires when agent scaled to 0 | Staleness-only rule can't see a vanished series — add the `absent(...)` clause. |
+| RESOLVED message body still says "is down" | Body not gated on `.Status` — wrap it in `{{ if eq .Status "firing" }}…{{ else }}✅ Recovered…{{ end }}`. |
+| Extra `KubeAPIErrorBudgetBurn` / `Watchdog` on Slack | Built-in rules — set `defaultRules: { create: false }` (top level) in `values-kind.yaml` + `helm upgrade`. A one-time RESOLVED per rule on removal is normal. |
+| Agent says `model_down` but pod is `1/1 Running` | Active probe hit `Connection refused` — model up but not Ready (GGUF reloading) or Service has no endpoint. Check `kubectl get endpoints llama-cpp-svc`. |
+| Alertmanager much slower than the agent | By design — scrape + `for:` window + `group_wait`. Brief dips fire the agent but not Path 1. |
+| `kubectl` returns `EOF` / connection reset | kind API server under memory pressure — `docker restart finbot-control-plane`, give Docker ≥ 8 GB. |
+| No Path-2 Slack messages | `SLACK_WEBHOOK` missing in the secret, or state is healthy (no incident = no message). |
+| Canary always fails | Wrong `GATEWAY_API_KEY`, or the model is genuinely down/degraded (empty responses score as fail). |
 
 ---
-
-## What each day proves (interview-ready)
-
-- **Days 1–5:** versioned data, gated model, self-healing CPU serving, resilient gateway.
-- **Day 6:** **deterministic monitoring first** — Prometheus + PromQL rules detect down/degraded/
-  error/restart, Alertmanager groups/routes/repeats and posts to Slack, and it all works with **no
-  LLM**. Model health is inferred from caller-side signals when the model has no `/metrics`.
-
-## License
-
-Code: MIT (educational). Base model (`Qwen/Qwen3-1.7B`, Apache-2.0) and dataset carry their own
-licenses.
-
----
-
-**Next — Day 7:** the **LangGraph agent** (Node C) — **Path 2**: it reads the same Prometheus data,
-explains *why* an incident is happening in plain English to Slack, and emits a heartbeat that
-activates the Day-6 `AgentHeartbeatLost` dead-man switch. The agent **never** remediates.

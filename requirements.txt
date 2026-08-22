@@ -30,6 +30,13 @@ pydantic>=2.6            # request validation
 prometheus_client>=0.20  # /metrics (Day 6 scrapes this)
 PyYAML>=6.0
 #-----------------------
+# finbot — Day 7 (LangGraph monitoring agent) dependencies. Pure Python.
+langgraph>=0.2           # the agent graph (StateGraph + conditional edges)
+redis>=5.0               # incident state (agent state)
+requests>=2.31           # Prometheus queries, probes, canary, Slack
+prometheus_client>=0.20  # heartbeat + agent metrics (/metrics :9108)
+PyYAML>=6.0
+#------------------------
 # ---- Optional NER PII layer (set pii.use_presidio: true; install via `make install-pii`) ----
 # presidio-analyzer>=2.2
 # presidio-anonymizer>=2.2
